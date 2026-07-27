@@ -2,13 +2,7 @@ import type { AnyAgentTool } from "openclaw/plugin-sdk/plugin-entry";
 import { type Static, Type } from "typebox";
 import type { TriliumClientHandle } from "../client.js";
 import { toToolResult, unwrap } from "../client.js";
-import {
-  contentStatusFor,
-  htmlToText,
-  looksLikeHtml,
-  normalizeLineEndings,
-  readRange,
-} from "./html.js";
+import { contentStatusFor, htmlToMarkdown, normalizeLineEndings, readRange } from "./html.js";
 
 // Attachments have no dedicated "list by note" endpoint search of their
 // own within this file -- use trilium_get_note's include_attachments flag
@@ -83,7 +77,8 @@ const getAttachmentParams = Type.Object({
   raw_html: Type.Optional(
     Type.Boolean({
       description:
-        "Only used with include_content. Skip HTML-to-plain-text conversion. Defaults to false.",
+        "Only used with include_content. Skip HTML-to-Markdown conversion (only applies when mime " +
+        "is text/html anyway). Defaults to false.",
     }),
   ),
 });
@@ -114,8 +109,10 @@ export function createGetAttachmentTool(handlePromise: Promise<TriliumClientHand
           parseAs: "text",
         }),
       );
-      const wantsPlainText = !(params.raw_html ?? false) && looksLikeHtml(rawContent);
-      const content = normalizeLineEndings(wantsPlainText ? htmlToText(rawContent) : rawContent);
+      // Attachments have no `type` field (only `mime`) -- gate on that
+      // real metadata instead of sniffing the content itself.
+      const wantsMarkdown = !(params.raw_html ?? false) && attachment.mime === "text/html";
+      const content = normalizeLineEndings(wantsMarkdown ? htmlToMarkdown(rawContent) : rawContent);
       const range = readRange(
         "trilium_get_attachment",
         content,

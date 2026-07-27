@@ -6,7 +6,12 @@ description: "Search, read, and lightly organize the user's Trilium notes via hy
 # Trilium Notes
 
 Tools: `trilium_search_notes`, `trilium_get_note`, `trilium_read_note_content`,
-`trilium_get_calendar_note`, `trilium_get_recent_changes`, `trilium_create_attribute`
+`trilium_create_note`, `trilium_update_note`, `trilium_delete_note`, `trilium_undelete_note`,
+`trilium_get_calendar_note`, `trilium_get_recent_changes`, `trilium_create_attribute`,
+`trilium_update_attribute`, `trilium_delete_attribute`, `trilium_place_note_in_tree`,
+`trilium_remove_note_from_location`, `trilium_create_attachment`, `trilium_get_attachment`,
+`trilium_update_attachment`, `trilium_delete_attachment`, `trilium_create_revision`,
+`trilium_read_revision_content`
 
 Facts:
 - `trilium_search_notes`: never returns full content. A result only gets a `content_snippet` when
@@ -17,6 +22,14 @@ Facts:
 - Every result carries a `url` -- always surface it, never omit.
 - "today's note" / "this week's journal" / inbox → `trilium_get_calendar_note`, not
   `trilium_search_notes`.
+- **Content format for `text`-type notes is Markdown, always** -- write `content` in
+  `trilium_create_note`/`trilium_update_note` as Markdown (`# heading`, `**bold**`, `- list`,
+  `[text](url)`); it's converted to Trilium's native HTML for you, and `trilium_read_note_content`
+  converts the stored HTML back to Markdown by default, so a note you read can be edited and
+  written straight back with the same syntax. Never hand-author literal HTML tags for ordinary
+  prose -- only pass `content_format: "html"` if you already have real HTML you deliberately want
+  stored verbatim. This does not apply to `code`-type notes (or any other non-`text` type): their
+  content is raw source, always written and read byte-for-byte, no conversion involved.
 
 ## Procedure
 

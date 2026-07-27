@@ -8,8 +8,7 @@ import {
   contentStatusFor,
   extractSnippet,
   formatContentForWrite,
-  htmlToText,
-  looksLikeHtml,
+  htmlToMarkdown,
   normalizeLineEndings,
   readRange,
 } from "./html.js";
@@ -484,9 +483,12 @@ export function createGetNoteTool(handlePromise: Promise<TriliumClientHandle>): 
       if (attachments) result.attachments = attachments;
       if (revisions) result.revisions = revisions;
       if (rawContent !== undefined) {
-        const plainText = looksLikeHtml(rawContent) ? htmlToText(rawContent) : rawContent;
+        // `note` (already fetched above) tells us the real type -- no
+        // content sniffing needed. Only `text` notes are CKEditor HTML;
+        // anything else (e.g. `code`) is raw source, left untouched.
+        const excerptSource = note.type === "text" ? htmlToMarkdown(rawContent) : rawContent;
         result.content_snippet = extractSnippet(
-          normalizeLineEndings(plainText),
+          normalizeLineEndings(excerptSource),
           params.excerpt_search,
         );
       }
@@ -510,10 +512,11 @@ const readNoteContentParams = Type.Object({
   raw_html: Type.Optional(
     Type.Boolean({
       description:
-        "Return the note's stored markup as-is instead of converting it to plain text. Trilium " +
-        "stores `text`-type note content as CKEditor HTML; this defaults to false since the plain-" +
-        "text conversion is far more token-efficient to read. Has no effect on notes whose content " +
-        "isn't HTML (e.g. `code` notes) -- those are always returned as-is.",
+        "Return the note's stored CKEditor HTML as-is instead of converting it to Markdown. " +
+        "Defaults to false -- Markdown is this plugin's normal content contract (see " +
+        "trilium_update_note), so the converted form is what you'll usually want to read, edit, and " +
+        "write straight back. Has no effect on notes whose content isn't HTML (e.g. `code` notes) -- " +
+        "those are always returned as-is.",
     }),
   ),
 });
@@ -530,23 +533,33 @@ export function createReadNoteContentTool(
       "content_snippet_start_line/end_line from trilium_search_notes). Capped at 500 lines per call " +
       "regardless of what's requested. `total_lines` in the response tells you whether there's more: " +
       "if end_line < total_lines, call again with start_line: end_line + 1. `text`-type note content " +
-      "(CKEditor HTML) is converted to plain text by default -- pass raw_html: true for the original " +
+      "(CKEditor HTML) is converted to Markdown by default -- pass raw_html: true for the original " +
       "markup. `content_status` is 'empty' for a note with no content yet, 'present' otherwise.",
     parameters: readNoteContentParams,
     execute: async (_toolCallId, params: Static<typeof readNoteContentParams>) => {
       const { client } = await handlePromise;
-      const rawContent = unwrap(
-        await client.GET("/notes/{noteId}/content", {
-          params: { path: { noteId: params.note_id } },
-          // openapi-fetch defaults every response to JSON.parse regardless
-          // of the actual Content-Type header -- this endpoint always
-          // returns text/html, never JSON, so parseAs must be overridden
-          // explicitly or a real HTML response throws a JSON parse error.
-          parseAs: "text",
-        }),
-      );
-      const wantsPlainText = !(params.raw_html ?? false) && looksLikeHtml(rawContent);
-      const content = normalizeLineEndings(wantsPlainText ? htmlToText(rawContent) : rawContent);
+      // Neither fetch depends on the other's output, so they run
+      // concurrently -- the note metadata is what tells us whether this is
+      // really a `text` note (CKEditor HTML) worth converting, rather than
+      // sniffing the content itself the way this used to work.
+      const [rawContent, note] = await Promise.all([
+        client
+          .GET("/notes/{noteId}/content", {
+            params: { path: { noteId: params.note_id } },
+            // openapi-fetch defaults every response to JSON.parse
+            // regardless of the actual Content-Type header -- this
+            // endpoint always returns text/html, never JSON, so parseAs
+            // must be overridden explicitly or a real HTML response
+            // throws a JSON parse error.
+            parseAs: "text",
+          })
+          .then(unwrap),
+        client
+          .GET("/notes/{noteId}", { params: { path: { noteId: params.note_id } } })
+          .then(unwrap),
+      ]);
+      const wantsMarkdown = !(params.raw_html ?? false) && note.type === "text";
+      const content = normalizeLineEndings(wantsMarkdown ? htmlToMarkdown(rawContent) : rawContent);
       const range = readRange(
         "trilium_read_note_content",
         content,
@@ -586,14 +599,9 @@ const createNoteParams = Type.Object({
   content: Type.Optional(
     Type.String({
       description:
-        "Initial content. For 'text' notes, plain text is auto-wrapped into HTML paragraphs unless " +
-        "it already looks like HTML (see content_format to force one or the other).",
-    }),
-  ),
-  content_format: Type.Optional(
-    Type.Union([Type.Literal("auto"), Type.Literal("html")], {
-      description:
-        "'auto' (default) auto-wraps plain text; 'html' passes content through verbatim.",
+        "Initial content. For 'text' notes, write Markdown (headings, bold, lists, links) -- it's " +
+        "always converted to Trilium's native HTML for you, there is no way to write raw HTML " +
+        "verbatim. Written byte-for-byte for every other type (e.g. 'code' notes: raw source).",
     }),
   ),
   note_position: Type.Optional(
@@ -625,9 +633,7 @@ export function createCreateNoteTool(handlePromise: Promise<TriliumClientHandle>
             title: params.title,
             type: params.type,
             mime: params.mime,
-            content: params.content
-              ? formatContentForWrite(params.content, params.content_format ?? "auto")
-              : "",
+            content: params.content ? formatContentForWrite(params.content, params.type) : "",
             notePosition: params.note_position,
             prefix: params.prefix,
           },
@@ -673,19 +679,20 @@ const updateNoteParams = Type.Object({
     ),
   ),
   mime: Type.Optional(Type.String({ description: "New MIME type." })),
-  content: Type.Optional(Type.String({ description: "Content to write (see content_mode)." })),
+  content: Type.Optional(
+    Type.String({
+      description:
+        "Content to write (see content_mode). For a 'text' note, write Markdown -- always converted " +
+        "to Trilium's native HTML, there is no way to write raw HTML verbatim. Written byte-for-byte " +
+        "for every other type.",
+    }),
+  ),
   content_mode: Type.Optional(
     Type.Union([Type.Literal("replace"), Type.Literal("append")], {
       description:
         "'replace' (default) overwrites the note's content entirely. 'append' adds `content` to the " +
         "end of the existing content, entirely server-side -- the existing body never has to pass " +
         "through your context first, unlike doing a 'replace' after reading the note.",
-    }),
-  ),
-  content_format: Type.Optional(
-    Type.Union([Type.Literal("auto"), Type.Literal("html")], {
-      description:
-        "Same as trilium_create_note's content_format. Only applies when content is given.",
     }),
   ),
 });
@@ -695,12 +702,13 @@ export function createUpdateNoteTool(handlePromise: Promise<TriliumClientHandle>
     name: "trilium_update_note",
     label: "Update a Trilium note",
     description:
-      "Update a note's title/type/mime and/or its content in one call. content_mode defaults to " +
-      "'replace' (the whole body is overwritten -- read the note first with trilium_read_note_content " +
-      "if you need to preserve part of it and aren't just appending); pass content_mode: 'append' to " +
-      "add `content` to the end of the existing body entirely server-side. Consider " +
-      "trilium_create_revision before a large content rewrite so the previous version stays " +
-      "recoverable.",
+      "Update a note's title/type/mime and/or its content in one call. For a 'text' note, write " +
+      "`content` as Markdown -- always converted to Trilium's native HTML, there is no way to write " +
+      "raw HTML verbatim. content_mode defaults to 'replace' (the whole body is overwritten -- read " +
+      "the note first with trilium_read_note_content if you need to preserve part of it and aren't " +
+      "just appending); pass content_mode: 'append' to add `content` to the end of the existing body " +
+      "entirely server-side. Consider trilium_create_revision before a large content rewrite so the " +
+      "previous version stays recoverable.",
     parameters: updateNoteParams,
     execute: async (_toolCallId, params: Static<typeof updateNoteParams>) => {
       const { client, baseUrl } = await handlePromise;
@@ -718,7 +726,21 @@ export function createUpdateNoteTool(handlePromise: Promise<TriliumClientHandle>
       }
 
       if (params.content !== undefined) {
-        let contentToWrite = formatContentForWrite(params.content, params.content_format ?? "auto");
+        // formatContentForWrite only converts Markdown for a `text` note,
+        // so the real type must be known before calling it -- silently
+        // defaulting to "text" would risk mangling a `code` note's raw
+        // source with Markdown conversion. params.type (this call) and
+        // note.type (from the PATCH above, if metadata changed) are free;
+        // only when neither is available does this pay for an extra
+        // metadata fetch.
+        let effectiveType = params.type ?? (note?.type as string | undefined);
+        if (effectiveType === undefined) {
+          const current = unwrap(
+            await client.GET("/notes/{noteId}", { params: { path: { noteId: params.note_id } } }),
+          );
+          effectiveType = current.type;
+        }
+        let contentToWrite = formatContentForWrite(params.content, effectiveType ?? "text");
         if (params.content_mode === "append") {
           const existing = unwrap(
             await client.GET("/notes/{noteId}/content", {
@@ -726,8 +748,11 @@ export function createUpdateNoteTool(handlePromise: Promise<TriliumClientHandle>
               parseAs: "text",
             }),
           );
+          // A `text` note's HTML blocks (e.g. adjacent <p> tags) don't need
+          // an extra separator; anything else (raw source) does, unless the
+          // existing content already ends in one.
           const separator =
-            existing.length > 0 && !looksLikeHtml(existing) && !existing.endsWith("\n") ? "\n" : "";
+            existing.length > 0 && effectiveType !== "text" && !existing.endsWith("\n") ? "\n" : "";
           contentToWrite = existing + separator + contentToWrite;
         }
         // ETAPI's content endpoint takes a bare `text/plain` body, not

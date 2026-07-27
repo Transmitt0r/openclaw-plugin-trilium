@@ -74,17 +74,42 @@ describe("trilium_create_revision", () => {
 });
 
 describe("trilium_read_revision_content", () => {
-  it("converts HTML content to plain text by default", async () => {
+  it("converts a text-type revision's HTML content to Markdown by default", async () => {
     const handle = setup([
       {
         test: (p, m) => p === "/etapi/revisions/rev1/content" && m === "GET",
-        handle: () => textResponse("<p>old content</p>"),
+        handle: () => textResponse("<h1>old content</h1>"),
+      },
+      {
+        test: (p, m) => p === "/etapi/revisions/rev1" && m === "GET",
+        handle: () => jsonResponse({ revisionId: "rev1", type: "text" }),
       },
     ]);
     const tool = createReadRevisionContentTool(handle);
     const result = (await tool.execute("call1", { revision_id: "rev1" })).details as {
       content: string;
     };
-    expect(result.content).toBe("old content");
+    expect(result.content).toBe("# old content");
+  });
+
+  // Regression test for the real bug this whole fix responds to: gating on
+  // the revision's real type metadata, not sniffing the content itself.
+  it("returns a code-type revision's content byte-for-byte", async () => {
+    const rawSource = "# not a heading\nconst x = 1;";
+    const handle = setup([
+      {
+        test: (p, m) => p === "/etapi/revisions/rev1/content" && m === "GET",
+        handle: () => textResponse(rawSource),
+      },
+      {
+        test: (p, m) => p === "/etapi/revisions/rev1" && m === "GET",
+        handle: () => jsonResponse({ revisionId: "rev1", type: "code" }),
+      },
+    ]);
+    const tool = createReadRevisionContentTool(handle);
+    const result = (await tool.execute("call1", { revision_id: "rev1" })).details as {
+      content: string;
+    };
+    expect(result.content).toBe(rawSource);
   });
 });

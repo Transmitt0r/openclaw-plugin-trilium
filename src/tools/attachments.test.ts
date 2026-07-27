@@ -74,15 +74,15 @@ describe("trilium_create_attachment", () => {
 });
 
 describe("trilium_get_attachment", () => {
-  it("includes bounded, converted content when requested", async () => {
+  it("converts an HTML-mime attachment's content to Markdown when requested", async () => {
     const handle = setup([
       {
         test: (p, m) => p === "/etapi/attachments/att1" && m === "GET",
-        handle: () => jsonResponse({ attachmentId: "att1", title: "note.html" }),
+        handle: () => jsonResponse({ attachmentId: "att1", title: "note.html", mime: "text/html" }),
       },
       {
         test: (p, m) => p === "/etapi/attachments/att1/content" && m === "GET",
-        handle: () => textResponse("<p>attachment body</p>"),
+        handle: () => textResponse("<h1>attachment body</h1>"),
       },
     ]);
     const tool = createGetAttachmentTool(handle);
@@ -90,7 +90,31 @@ describe("trilium_get_attachment", () => {
       .details as {
       content: string;
     };
-    expect(result.content).toBe("attachment body");
+    expect(result.content).toBe("# attachment body");
+  });
+
+  // Regression test for the real bug this whole fix responds to: gating on
+  // real mime metadata, not sniffing the content itself -- an attachment
+  // whose mime isn't text/html must be returned byte-for-byte even if its
+  // content happens to contain characters that look like HTML tags.
+  it("returns a non-HTML-mime attachment's content byte-for-byte", async () => {
+    const rawContent = "<not-real-html>just plain text</not-real-html>";
+    const handle = setup([
+      {
+        test: (p, m) => p === "/etapi/attachments/att1" && m === "GET",
+        handle: () => jsonResponse({ attachmentId: "att1", title: "note.txt", mime: "text/plain" }),
+      },
+      {
+        test: (p, m) => p === "/etapi/attachments/att1/content" && m === "GET",
+        handle: () => textResponse(rawContent),
+      },
+    ]);
+    const tool = createGetAttachmentTool(handle);
+    const result = (await tool.execute("call1", { attachment_id: "att1", include_content: true }))
+      .details as {
+      content: string;
+    };
+    expect(result.content).toBe(rawContent);
   });
 });
 

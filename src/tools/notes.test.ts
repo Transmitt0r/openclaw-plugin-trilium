@@ -164,9 +164,11 @@ describe("trilium_update_note", () => {
   // Regression test for a real bug found in review: the content PUT's
   // result was discarded, so a failed write fell through to a re-fetch and
   // reported the note's stale, pre-write content back as success. With no
-  // metadata fields given, a content-only update no longer does a
-  // pre-write GET at all (see the next test) -- so this asserts zero GETs
-  // happened, not one.
+  // metadata fields given, effectiveType is unknown and must be resolved
+  // before deciding whether to Markdown-convert (see the note below) --
+  // that's the one GET that legitimately happens here, before the PUT is
+  // even attempted; the PUT then fails and there must be no *second* GET
+  // afterward pretending the write succeeded.
   it("throws instead of silently returning stale content when the content PUT fails", async () => {
     let getCount = 0;
     const handle = setup([
@@ -186,14 +188,17 @@ describe("trilium_update_note", () => {
     await expect(
       tool.execute("call1", { note_id: "note1", content: "new content" }),
     ).rejects.toThrow(/NOTE_IS_PROTECTED/);
-    expect(getCount).toBe(0);
+    expect(getCount).toBe(1);
   });
 
-  // Regression test for a real perf issue found in review: a content-only
-  // update (no title/type/mime) used to do a pre-write GET whose result was
-  // immediately discarded, then a second GET after the PUT -- 3 calls where
-  // 2 suffice. Asserts the pre-write GET no longer happens.
-  it("does a content-only update in exactly one GET (no wasted pre-write fetch)", async () => {
+  // A content-only update whose note type is genuinely unknown (no
+  // metadata change given, so no PATCH response to read type off of) pays
+  // for one metadata GET to resolve it before writing -- this is a
+  // deliberate safety trade-off, not a regression: without it, the
+  // Markdown conversion could silently mangle a `code` note's raw source.
+  // Total: type-check GET + content PUT + final result GET = 3 calls (2 of
+  // them to the same GET route, hence getCount reaching 2).
+  it("resolves the note's type via one extra GET before deciding whether to convert", async () => {
     let getCount = 0;
     const handle = setup([
       {
@@ -210,6 +215,33 @@ describe("trilium_update_note", () => {
     ]);
     const tool = createUpdateNoteTool(handle);
     await tool.execute("call1", { note_id: "note1", content: "hello" });
+    expect(getCount).toBe(2);
+  });
+
+  // When a metadata change is given in the same call, the PATCH response
+  // already carries the note's type -- no extra GET needed before deciding
+  // whether to Markdown-convert the content.
+  it("skips the type-check GET when a metadata change already reveals the type", async () => {
+    let getCount = 0;
+    const handle = setup([
+      {
+        test: (p, m) => p === "/etapi/notes/note1" && m === "PATCH",
+        handle: () => jsonResponse(baseNote({ title: "New Title" })),
+      },
+      {
+        test: (p, m) => p === "/etapi/notes/note1/content" && m === "PUT",
+        handle: () => new Response(null, { status: 204 }),
+      },
+      {
+        test: (p, m) => p === "/etapi/notes/note1" && m === "GET",
+        handle: () => {
+          getCount += 1;
+          return jsonResponse(baseNote());
+        },
+      },
+    ]);
+    const tool = createUpdateNoteTool(handle);
+    await tool.execute("call1", { note_id: "note1", title: "New Title", content: "hello" });
     expect(getCount).toBe(1);
   });
 
@@ -369,11 +401,15 @@ describe("trilium_get_note", () => {
 });
 
 describe("trilium_read_note_content", () => {
-  it("converts HTML content to plain text by default and bounds the range", async () => {
+  it("converts a text note's HTML content to Markdown by default and bounds the range", async () => {
     const handle = setup([
       {
         test: (p, m) => p === "/etapi/notes/note1/content" && m === "GET",
-        handle: () => textResponse("<p>line one</p><p>line two</p>"),
+        handle: () => textResponse("<h1>line one</h1><p>line two</p>"),
+      },
+      {
+        test: (p, m) => p === "/etapi/notes/note1" && m === "GET",
+        handle: () => jsonResponse(baseNote()),
       },
     ]);
     const tool = createReadNoteContentTool(handle);
@@ -381,7 +417,7 @@ describe("trilium_read_note_content", () => {
       content: string;
       content_status: string;
     };
-    expect(result.content).toBe("line one\n\nline two");
+    expect(result.content).toBe("# line one\n\nline two");
     expect(result.content_status).toBe("present");
   });
 
@@ -391,12 +427,39 @@ describe("trilium_read_note_content", () => {
         test: (p, m) => p === "/etapi/notes/note1/content" && m === "GET",
         handle: () => textResponse("<p>keep me</p>"),
       },
+      {
+        test: (p, m) => p === "/etapi/notes/note1" && m === "GET",
+        handle: () => jsonResponse(baseNote()),
+      },
     ]);
     const tool = createReadNoteContentTool(handle);
     const result = (await tool.execute("call1", { note_id: "note1", raw_html: true })).details as {
       content: string;
     };
     expect(result.content).toBe("<p>keep me</p>");
+  });
+
+  // Regression test for the real bug this whole fix responds to (see
+  // html.test.ts): a `code` note's raw source must never be run through
+  // HTML-to-Markdown conversion, gated on real type metadata rather than
+  // sniffing whether the content happens to contain "#"/"-" characters.
+  it("returns a code note's content byte-for-byte, never Markdown-converted", async () => {
+    const rawSource = "# not a heading\nconst x = 1;\n- not a list";
+    const handle = setup([
+      {
+        test: (p, m) => p === "/etapi/notes/note1/content" && m === "GET",
+        handle: () => textResponse(rawSource),
+      },
+      {
+        test: (p, m) => p === "/etapi/notes/note1" && m === "GET",
+        handle: () => jsonResponse(baseNote({ type: "code", mime: "application/javascript" })),
+      },
+    ]);
+    const tool = createReadNoteContentTool(handle);
+    const result = (await tool.execute("call1", { note_id: "note1" })).details as {
+      content: string;
+    };
+    expect(result.content).toBe(rawSource);
   });
 });
 

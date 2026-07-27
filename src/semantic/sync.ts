@@ -5,7 +5,7 @@ import {
 } from "openclaw/plugin-sdk/memory-core-host-engine-storage";
 import type { TriliumClient } from "../client.js";
 import { unwrap } from "../client.js";
-import { htmlToText, looksLikeHtml, normalizeLineEndings } from "../tools/html.js";
+import { htmlToMarkdown, normalizeLineEndings } from "../tools/html.js";
 import { INDEXABLE_TYPES_FILTER, toUtcDateTimeLiteral } from "./query.js";
 import type { SemanticIndexStore, UpsertChunk } from "./store.js";
 import type { SemanticSearchConfig } from "./types.js";
@@ -185,8 +185,12 @@ async function processNotes(
           parseAs: "text",
         }),
       );
-      const plainText = looksLikeHtml(rawContent) ? htmlToText(rawContent) : rawContent;
-      const normalized = normalizeLineEndings(plainText);
+      // row.type came from the search response itself -- already-known
+      // real metadata, not content sniffing. Only `text` notes are
+      // CKEditor HTML; `code` notes (also indexed, see
+      // INDEXABLE_TYPES_FILTER) are raw source and are embedded as-is.
+      const embedSource = row.type === "text" ? htmlToMarkdown(rawContent) : rawContent;
+      const normalized = normalizeLineEndings(embedSource);
 
       const chunks = chunkMarkdown(normalized, {
         tokens: config.chunkTokens,

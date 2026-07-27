@@ -1,11 +1,24 @@
 // Shared helpers for Trilium's `text`-type note content, which Trilium's
 // own CKEditor-based UI always stores as HTML -- unlike paperless-ngx's
-// OCR content, which is already plain text. A tool-calling model reading
-// raw `<p>`/`<ul>` markup wastes tokens on structural noise it doesn't
-// need (see the "return only high-signal information" guidance this
-// plugin otherwise follows), so reads convert to plain text by default;
-// writes accept plain text and auto-wrap it, unless the caller opts into
-// raw HTML either way.
+// OCR content, which is already plain text. Markdown is this plugin's one
+// content contract for `text`-type notes, in both directions: writes are
+// Markdown by default (converted to HTML server-side via `marked`) and
+// reads convert stored HTML back to Markdown by default (via
+// `node-html-markdown`), so an agent reading a note's content can edit it
+// and write the result straight back with the same syntax. There is
+// deliberately no auto-detection between Markdown/HTML/plain-text -- a
+// prior heuristic ("does this look like HTML?") silently mis-stored literal
+// Markdown syntax (e.g. "# Heading" saved as the literal text "# Heading"
+// instead of a real heading) whenever a caller didn't already know to opt
+// out, which is exactly what every model's default instinct produces when
+// asked to write "note content". There is also deliberately no HTML
+// escape hatch -- mirrors Trilium's own first-party MCP tool implementation
+// (`note_tools.ts`), which has none either. Neither direction applies to
+// non-`text` note types (`code` notes are raw source) -- every call site
+// gates that on the note's actual `type` metadata, never on sniffing the
+// content itself.
+import { marked } from "marked";
+import { NodeHtmlMarkdown } from "node-html-markdown";
 
 // `String.slice` operates on UTF-16 code units, so a boundary computed by
 // character count can land inside a surrogate pair (emoji, some CJK) and
@@ -24,108 +37,34 @@ export function normalizeLineEndings(content: string): string {
   return content.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
 }
 
-const HTML_ENTITIES: Record<string, string> = {
-  "&amp;": "&",
-  "&lt;": "<",
-  "&gt;": ">",
-  "&quot;": '"',
-  "&#39;": "'",
-  "&apos;": "'",
-  "&nbsp;": " ",
-};
-
-function decodeEntities(text: string): string {
-  return text
-    .replace(/&(?:amp|lt|gt|quot|#39|apos|nbsp);/g, (entity) => HTML_ENTITIES[entity] ?? entity)
-    .replace(/&#(\d+);/g, (_match, code) => String.fromCodePoint(Number(code)))
-    .replace(/&#x([0-9a-fA-F]+);/g, (_match, code) =>
-      String.fromCodePoint(Number.parseInt(code, 16)),
-    );
+// Trilium's content endpoint always returns text/html regardless of note
+// type (there's no separate raw-source endpoint for `code` notes), so this
+// is only ever called once a caller has already confirmed the note's type
+// is `text` from real metadata -- never from sniffing the content itself.
+export function htmlToMarkdown(html: string): string {
+  return NodeHtmlMarkdown.translate(html, { bulletMarker: "-" });
 }
 
-// Known HTML tag names Trilium's CKEditor realistically produces --
-// deliberately a whitelist rather than "any <word...> shape", which
-// previously false-positived on ordinary text containing a generic-type or
-// comparison-like fragment (e.g. "Array<string>", "x<y>less than z"),
-// causing formatContentForWrite to skip auto-wrapping and store that text
-// raw/unescaped -- Trilium's editor then parses the false "tag" as literal,
-// broken markup.
-const KNOWN_HTML_TAGS =
-  "p|div|span|br|hr|ul|ol|li|h[1-6]|a|strong|b|em|i|u|s|strike|table|thead|tbody|tfoot|tr|td|th|" +
-  "blockquote|pre|code|img|figure|figcaption|sub|sup|mark|small|del|ins|dl|dt|dd|section|article";
-const HTML_TAG_PATTERN = new RegExp(`<\\s*/?\\s*(?:${KNOWN_HTML_TAGS})(?:[\\s>/]|$)`, "i");
-
-// Best-effort detector for "this note content is HTML" -- Trilium's own
-// content endpoint has no separate flag for it (the response is always
-// `text/html` per the ETAPI schema regardless of note type), so this
-// sniffs for a known-tag opening/closing sequence rather than trusting the
-// content-type header, which is the same for a `code` note's plain source
-// as it is for a `text` note's markup.
-export function looksLikeHtml(content: string): boolean {
-  return HTML_TAG_PATTERN.test(content.slice(0, 500));
+// Converts Markdown to the HTML Trilium's CKEditor-based UI expects to
+// store for a `text` note. Synchronous: `marked.parse` only returns a
+// Promise when async walkTokens/extensions are configured, which this
+// plugin doesn't use.
+export function markdownToHtml(markdown: string): string {
+  // marked always appends a trailing newline after the last block --
+  // trimmed for a clean stored value (CKEditor doesn't care either way,
+  // but an untrimmed value would be a needless cosmetic inconsistency).
+  return (marked.parse(markdown, { async: false }) as string).trim();
 }
 
-// Converts Trilium's CKEditor-authored HTML into readable plain text:
-// paragraph-level closers (p/div/h1-6/blockquote/pre) become a blank line
-// so distinct paragraphs stay visually separated (matching textToHtml's
-// own paragraph model, which splits back apart on a blank line), while
-// list items and table rows -- usually many adjacent lines, not separate
-// paragraphs -- get a single line break instead. Not a general-purpose
-// HTML-to-Markdown converter (no bold/italic/link preservation) -- the
-// goal is a low-noise read, not a faithful re-render; use `raw_html: true`
-// on the read tool for anything that needs the actual markup back.
-export function htmlToText(html: string): string {
-  const withBreaks = html
-    .replace(/<(script|style)[^>]*>[\s\S]*?<\/\1>/gi, "")
-    .replace(/<br\s*\/?>/gi, "\n")
-    // A nested <ul>/<ol> opening mid-item (e.g. <li>Parent<ul><li>Child)
-    // otherwise has no break before it at all -- only the closing tags
-    // below get one -- so the parent item's text and the nested list's
-    // first bullet merge onto a single line.
-    .replace(/<(ul|ol)[^>]*>/gi, "\n")
-    // <td>/<th> boundaries are otherwise silently stripped with no
-    // separator, so adjacent table cells (e.g. <td>Name</td><td>Age</td>)
-    // concatenate into "NameAge" -- a tab keeps cells visually distinct
-    // without claiming to be a real table renderer.
-    .replace(/<\/(td|th)>/gi, "\t")
-    .replace(/<\/(li|tr)>/gi, "\n")
-    .replace(/<\/(p|div|h[1-6]|blockquote|pre)>/gi, "\n\n")
-    .replace(/<li[^>]*>/gi, "- ")
-    .replace(/<[^>]+>/g, "");
-  return decodeEntities(withBreaks)
-    .replace(/\n{3,}/g, "\n\n")
-    .split("\n")
-    .map((line) => line.replace(/[ \t]+$/g, ""))
-    .join("\n")
-    .trim();
-}
-
-// Converts plain text back into minimal HTML paragraphs so a model that
-// writes plain text still gets sane rendering in Trilium's editor:
-// blank-line-separated blocks become <p>...</p>, single newlines within a
-// block become <br>. Only applied when the caller's input doesn't already
-// look like HTML (see looksLikeHtml) -- passing through already-authored
-// markup verbatim avoids double-escaping angle brackets a caller
-// deliberately included.
-export function textToHtml(text: string): string {
-  // Without this, Windows-style \r\n input doesn't split into paragraphs
-  // at all (the \n{2,} pattern below never matches a lone \n preceded by
-  // \r), collapsing every intended paragraph into one <br>-joined block
-  // with literal \r characters left in the stored HTML.
-  const normalized = normalizeLineEndings(text);
-  const escaped = normalized.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  const paragraphs = escaped.split(/\n{2,}/).map((block) => block.replace(/\n/g, "<br>"));
-  return paragraphs.map((block) => `<p>${block}</p>`).join("");
-}
-
-// Shared by every content-write tool (notes, attachments): pass through
-// verbatim if the caller already wrote HTML (or the note/attachment isn't
-// a `text`-flavored one, e.g. `code` source), otherwise auto-wrap plain
-// text into paragraphs so it renders reasonably instead of as one
-// unbroken line.
-export function formatContentForWrite(content: string, format: "auto" | "html"): string {
-  if (format === "html") return content;
-  return looksLikeHtml(content) ? content : textToHtml(content);
+// Shared by every content-write tool that can target a `text`-type note
+// (notes.ts's create/update): converts Markdown to HTML for a `text` note,
+// verbatim passthrough for every other type (`code`/etc. notes are raw
+// source, not Markdown or HTML -- conversion would corrupt them). Mirrors
+// Trilium's own first-party MCP tool implementation exactly (`note_tools.ts`:
+// `type === "text" ? markdownImport.renderToHtml(content, title) : content`)
+// -- deliberately no HTML escape hatch, matching that upstream precedent.
+export function formatContentForWrite(content: string, noteType: string): string {
+  return noteType === "text" ? markdownToHtml(content) : content;
 }
 
 export type ContentStatus = "present" | "null" | "empty";
@@ -156,7 +95,7 @@ export type BoundedRead = {
 // produce it: every caller already fetched the note/attachment/revision's
 // *entire* content over HTTP (ETAPI's content endpoints have no Range-
 // header/partial-fetch support to bound that part), and ran the full
-// string through htmlToText's regex passes and this function's own
+// string through htmlToMarkdown's conversion and this function's own
 // content.split("\n") before this slice happens. Reading lines 1-10 of a
 // very large note still pays that full cost -- accepted the same way
 // paperless-ngx's sibling function accepts it, since neither API offers a

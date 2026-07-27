@@ -2,13 +2,7 @@ import type { AnyAgentTool } from "openclaw/plugin-sdk/plugin-entry";
 import { type Static, Type } from "typebox";
 import type { TriliumClientHandle } from "../client.js";
 import { toToolResult, unwrap } from "../client.js";
-import {
-  contentStatusFor,
-  htmlToText,
-  looksLikeHtml,
-  normalizeLineEndings,
-  readRange,
-} from "./html.js";
+import { contentStatusFor, htmlToMarkdown, normalizeLineEndings, readRange } from "./html.js";
 
 // Listing a note's revisions is trilium_get_note's include_revisions flag
 // (GET /notes/{noteId}/revisions), not a tool here -- this file only
@@ -54,7 +48,7 @@ const readRevisionContentParams = Type.Object({
   ),
   raw_html: Type.Optional(
     Type.Boolean({
-      description: "Skip HTML-to-plain-text conversion for text-type revisions. Defaults to false.",
+      description: "Skip HTML-to-Markdown conversion for a text-type revision. Defaults to false.",
     }),
   ),
 });
@@ -67,22 +61,31 @@ export function createReadRevisionContentTool(
     label: "Read a Trilium revision's content",
     description:
       "Read a past revision's content, bounded to a line range -- same semantics as " +
-      "trilium_read_note_content. Use this to see what a note used to say before comparing against " +
-      "its current content.",
+      "trilium_read_note_content (Markdown by default for a text-type revision). Use this to see " +
+      "what a note used to say before comparing against its current content.",
     parameters: readRevisionContentParams,
     execute: async (_toolCallId, params: Static<typeof readRevisionContentParams>) => {
       const { client } = await handlePromise;
-      const rawContent = unwrap(
-        await client.GET("/revisions/{revisionId}/content", {
-          params: { path: { revisionId: params.revision_id } },
-          // See src/tools/notes.ts's identical override -- openapi-fetch
-          // defaults to JSON.parse regardless of the real (text/html)
-          // Content-Type here.
-          parseAs: "text",
-        }),
-      );
-      const wantsPlainText = !(params.raw_html ?? false) && looksLikeHtml(rawContent);
-      const content = normalizeLineEndings(wantsPlainText ? htmlToText(rawContent) : rawContent);
+      // Neither fetch depends on the other's output, so they run
+      // concurrently -- the revision metadata's `type` tells us whether
+      // this is really CKEditor HTML worth converting, rather than
+      // sniffing the content itself.
+      const [rawContent, revision] = await Promise.all([
+        client
+          .GET("/revisions/{revisionId}/content", {
+            params: { path: { revisionId: params.revision_id } },
+            // See src/tools/notes.ts's identical override -- openapi-fetch
+            // defaults to JSON.parse regardless of the real (text/html)
+            // Content-Type here.
+            parseAs: "text",
+          })
+          .then(unwrap),
+        client
+          .GET("/revisions/{revisionId}", { params: { path: { revisionId: params.revision_id } } })
+          .then(unwrap),
+      ]);
+      const wantsMarkdown = !(params.raw_html ?? false) && revision.type === "text";
+      const content = normalizeLineEndings(wantsMarkdown ? htmlToMarkdown(rawContent) : rawContent);
       const range = readRange(
         "trilium_read_revision_content",
         content,

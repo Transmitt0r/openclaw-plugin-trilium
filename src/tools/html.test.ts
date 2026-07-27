@@ -3,101 +3,71 @@ import {
   contentStatusFor,
   extractSnippet,
   formatContentForWrite,
-  htmlToText,
-  looksLikeHtml,
+  htmlToMarkdown,
+  markdownToHtml,
   readRange,
-  textToHtml,
 } from "./html.js";
 
-describe("looksLikeHtml", () => {
-  it("detects HTML-shaped content", () => {
-    expect(looksLikeHtml("<p>Hello</p>")).toBe(true);
-    expect(looksLikeHtml('<div class="x">Hello</div>')).toBe(true);
-    expect(looksLikeHtml("plain text <br> more text")).toBe(true);
+describe("markdownToHtml", () => {
+  it("converts headings, bold, and lists to real HTML", () => {
+    const html = markdownToHtml("# Heading\n\nSome **bold** text.\n\n- one\n- two\n");
+    expect(html).toContain("<h1>Heading</h1>");
+    expect(html).toContain("<strong>bold</strong>");
+    expect(html).toContain("<li>one</li>");
+    expect(html).toContain("<li>two</li>");
   });
 
-  it("does not flag plain text or code as HTML", () => {
-    expect(looksLikeHtml("just some plain text")).toBe(false);
-    expect(looksLikeHtml("const x = 1 < 2;")).toBe(false);
-  });
-
-  // Regression test for a real bug found in review: the old heuristic
-  // matched any "<word...>" shape, so ordinary text containing a
-  // generic-type or comparison-like fragment was misdetected as HTML.
-  it("does not false-positive on generic-type-like or comparison text", () => {
-    expect(looksLikeHtml("a function returning Array<string> values")).toBe(false);
-    expect(looksLikeHtml("if x<y> then something")).toBe(false);
+  it("does not mangle literal markdown-looking characters that aren't meant as syntax", () => {
+    // A lone "#" with no space, or "**" without a matching pair, should not
+    // produce broken/half-converted markup.
+    expect(markdownToHtml("price is 5 * 3 = 15")).toContain("5 * 3 = 15");
   });
 });
 
-describe("htmlToText", () => {
-  it("converts paragraphs and line breaks to newlines", () => {
-    expect(htmlToText("<p>First</p><p>Second<br>third</p>")).toBe("First\n\nSecond\nthird");
+describe("htmlToMarkdown", () => {
+  it("converts headings, bold, and lists back to Markdown", () => {
+    const md = htmlToMarkdown("<h1>Heading</h1><p>Some <strong>bold</strong> text</p>");
+    expect(md).toContain("# Heading");
+    expect(md).toContain("**bold**");
   });
 
-  it("converts list items to dashed lines", () => {
-    expect(htmlToText("<ul><li>one</li><li>two</li></ul>")).toBe("- one\n- two");
+  it("uses a dash bullet marker for lists (not the library's default asterisk)", () => {
+    const md = htmlToMarkdown("<ul><li>one</li><li>two</li></ul>");
+    expect(md).toBe("- one\n- two");
   });
 
-  it("strips script/style blocks entirely", () => {
-    expect(htmlToText("<p>keep</p><script>evil()</script><style>.x{}</style>")).toBe("keep");
-  });
-
-  it("decodes common HTML entities", () => {
-    expect(htmlToText("<p>Tom &amp; Jerry &lt;3&gt;</p>")).toBe("Tom & Jerry <3>");
-  });
-
-  it("collapses excessive blank lines", () => {
-    expect(htmlToText("<p>a</p><p></p><p></p><p></p><p>b</p>")).not.toMatch(/\n{3,}/);
-  });
-
-  // Regression test for a real bug found in review: adjacent table cells
-  // had no separator at all and concatenated into one word.
-  it("separates adjacent table cells instead of concatenating them", () => {
-    expect(htmlToText("<table><tr><td>Name</td><td>Age</td></tr></table>")).toBe("Name\tAge");
-  });
-
-  // Regression test for a real bug found in review: a nested list opening
-  // mid-item merged the parent item's text with the nested list's first
-  // bullet onto one line.
-  it("breaks before a nested list instead of merging it into the parent item's line", () => {
-    const result = htmlToText("<ul><li>Parent<ul><li>Child</li></ul></li></ul>");
-    expect(result).toBe("- Parent\n- Child");
+  it("passes plain text through unchanged (no HTML to convert)", () => {
+    expect(htmlToMarkdown("just plain text")).toBe("just plain text");
   });
 });
 
-describe("textToHtml / formatContentForWrite", () => {
-  it("wraps blank-line-separated blocks into paragraphs and single newlines into <br>", () => {
-    expect(textToHtml("first line\nsecond line\n\nnew paragraph")).toBe(
-      "<p>first line<br>second line</p><p>new paragraph</p>",
-    );
+describe("formatContentForWrite", () => {
+  it("converts Markdown to HTML for a 'text' note", () => {
+    const result = formatContentForWrite("# Hello\n\n**world**", "text");
+    expect(result).toContain("<h1>Hello</h1>");
+    expect(result).toContain("<strong>world</strong>");
   });
 
-  it("escapes angle brackets in plain text before wrapping", () => {
-    expect(textToHtml("a < b & c > d")).toBe("<p>a &lt; b &amp; c &gt; d</p>");
+  // Regression test for the real bug this replaces: literal Markdown syntax
+  // (e.g. "# Inbox") used to be stored as-is inside a <p> tag instead of
+  // being rendered as a heading, because the old auto-detection only
+  // recognized real HTML tags, not Markdown.
+  it("does not leave literal Markdown syntax unconverted for a 'text' note", () => {
+    const result = formatContentForWrite("# Inbox", "text");
+    expect(result).not.toContain("# Inbox");
+    expect(result).toContain("<h1>Inbox</h1>");
   });
 
-  // Regression test for a real bug found in review: CRLF input never
-  // normalized before splitting on \n{2,}, so Windows-style line endings
-  // collapsed every paragraph into one <br>-joined block with literal \r
-  // characters left in the stored HTML.
-  it("normalizes CRLF before splitting into paragraphs", () => {
-    expect(textToHtml("first line\r\nsecond line\r\n\r\nnew paragraph")).toBe(
-      "<p>first line<br>second line</p><p>new paragraph</p>",
-    );
-  });
-
-  it("formatContentForWrite passes through content that already looks like HTML", () => {
-    const html = "<p>already html</p>";
-    expect(formatContentForWrite(html, "auto")).toBe(html);
-  });
-
-  it("formatContentForWrite auto-wraps plain text", () => {
-    expect(formatContentForWrite("hello", "auto")).toBe("<p>hello</p>");
-  });
-
-  it("formatContentForWrite passes through verbatim when format is html", () => {
-    expect(formatContentForWrite("hello", "html")).toBe("hello");
+  // Regression test for the related bug this fix specifically guards
+  // against: a `code` note's raw source must never be run through Markdown
+  // conversion, even though it might contain "#"/"-"/"*" characters that
+  // would otherwise look like Markdown syntax. There is deliberately no
+  // format override to opt back into conversion for a non-'text' note --
+  // mirrors Trilium's own first-party MCP tool implementation, which has
+  // none either.
+  it("never converts content for a non-'text' note", () => {
+    const code = "# comment, not a heading\nconst x = [1, 2, 3];\n- not a list either";
+    expect(formatContentForWrite(code, "code")).toBe(code);
   });
 });
 
