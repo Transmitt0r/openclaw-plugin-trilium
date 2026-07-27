@@ -5,6 +5,7 @@ import { noteUrl, toToolResult, unwrap } from "../client.js";
 import type { SemanticSearchHandle } from "../semantic/handle.js";
 import type { SemanticMatch } from "../semantic/types.js";
 import {
+  applyTextEdits,
   contentStatusFor,
   extractSnippet,
   formatContentForWrite,
@@ -682,18 +683,41 @@ const updateNoteParams = Type.Object({
   content: Type.Optional(
     Type.String({
       description:
-        "Content to write (see content_mode). For a 'text' note, write Markdown -- always converted " +
-        "to Trilium's native HTML, there is no way to write raw HTML verbatim. Written byte-for-byte " +
-        "for every other type.",
+        "Content to write when content_mode is 'replace' or 'append' (default 'replace'). For a " +
+        "'text' note, write Markdown -- always converted to Trilium's native HTML, there is no way " +
+        "to write raw HTML verbatim. Written byte-for-byte for every other type. Ignored when " +
+        "content_mode is 'edit' (use `edits` instead).",
     }),
   ),
   content_mode: Type.Optional(
-    Type.Union([Type.Literal("replace"), Type.Literal("append")], {
+    Type.Union([Type.Literal("replace"), Type.Literal("append"), Type.Literal("edit")], {
       description:
-        "'replace' (default) overwrites the note's content entirely. 'append' adds `content` to the " +
-        "end of the existing content, entirely server-side -- the existing body never has to pass " +
-        "through your context first, unlike doing a 'replace' after reading the note.",
+        "'replace' (default) overwrites the note's content entirely using `content`. 'append' adds " +
+        "`content` to the end of the existing content, entirely server-side -- the existing body " +
+        "never has to pass through your context first. 'edit' applies targeted find-and-replace " +
+        "edits from `edits` instead -- far cheaper than 'replace' for a small change to a large " +
+        "note, since the unchanged content never has to pass through your context either way. Not " +
+        "supported for 'text' notes (their content is CKEditor HTML, not raw source -- a literal " +
+        "find/replace risks altering unrelated formatting elsewhere in the note); use 'replace' or " +
+        "'append' for those instead.",
     }),
+  ),
+  edits: Type.Optional(
+    Type.Array(
+      Type.Object({
+        old_text: Type.String({
+          description:
+            "Exact text to find and replace. Must occur exactly once in the note's content -- " +
+            "include enough surrounding context that it uniquely identifies one location.",
+        }),
+        new_text: Type.String({ description: "Replacement text." }),
+      }),
+      {
+        description:
+          "One or more find-and-replace edits, applied in order (so a later edit may target text an " +
+          "earlier one introduced). Only used when content_mode is 'edit'.",
+      },
+    ),
   ),
 });
 
@@ -707,8 +731,10 @@ export function createUpdateNoteTool(handlePromise: Promise<TriliumClientHandle>
       "raw HTML verbatim. content_mode defaults to 'replace' (the whole body is overwritten -- read " +
       "the note first with trilium_read_note_content if you need to preserve part of it and aren't " +
       "just appending); pass content_mode: 'append' to add `content` to the end of the existing body " +
-      "entirely server-side. Consider trilium_create_revision before a large content rewrite so the " +
-      "previous version stays recoverable.",
+      "entirely server-side, or content_mode: 'edit' with `edits` for one or more targeted find-and-" +
+      "replace changes to a non-'text' note without resending the rest of its content. Consider " +
+      "trilium_create_revision before a large content rewrite so the previous version stays " +
+      "recoverable.",
     parameters: updateNoteParams,
     execute: async (_toolCallId, params: Static<typeof updateNoteParams>) => {
       const { client, baseUrl } = await handlePromise;
@@ -725,7 +751,55 @@ export function createUpdateNoteTool(handlePromise: Promise<TriliumClientHandle>
         );
       }
 
-      if (params.content !== undefined) {
+      if (params.content_mode === "edit") {
+        if (!params.edits || params.edits.length === 0) {
+          throw new Error(
+            "trilium_update_note: content_mode 'edit' requires at least one entry in `edits`.",
+          );
+        }
+        // Same type-resolution logic as the replace/append branch below --
+        // needed here to reject a 'text' note before ever fetching its
+        // content, not just to pick a conversion.
+        let effectiveType = params.type ?? (note?.type as string | undefined);
+        if (effectiveType === undefined) {
+          const current = unwrap(
+            await client.GET("/notes/{noteId}", { params: { path: { noteId: params.note_id } } }),
+          );
+          effectiveType = current.type;
+        }
+        if (effectiveType === "text") {
+          throw new Error(
+            "trilium_update_note: content_mode 'edit' isn't supported for 'text' notes -- their " +
+              "content is CKEditor HTML, not raw source, so a literal find/replace risks altering " +
+              "unrelated formatting elsewhere in the note. Use content_mode 'replace' or 'append' " +
+              "instead.",
+          );
+        }
+        const existing = unwrap(
+          await client.GET("/notes/{noteId}/content", {
+            params: { path: { noteId: params.note_id } },
+            parseAs: "text",
+          }),
+        );
+        const result = applyTextEdits(
+          existing,
+          params.edits.map((e) => ({ oldText: e.old_text, newText: e.new_text })),
+        );
+        if (!result.ok) {
+          throw new Error(`trilium_update_note: ${result.error}`);
+        }
+        unwrap(
+          await client.PUT("/notes/{noteId}/content", {
+            params: { path: { noteId: params.note_id } },
+            headers: { "Content-Type": "text/plain" },
+            body: result.content,
+            bodySerializer: (body: unknown) => body as string,
+          }),
+        );
+        note = unwrap(
+          await client.GET("/notes/{noteId}", { params: { path: { noteId: params.note_id } } }),
+        );
+      } else if (params.content !== undefined) {
         // formatContentForWrite only converts Markdown for a `text` note,
         // so the real type must be known before calling it -- silently
         // defaulting to "text" would risk mangling a `code` note's raw

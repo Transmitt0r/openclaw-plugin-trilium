@@ -67,6 +67,55 @@ export function formatContentForWrite(content: string, noteType: string): string
   return noteType === "text" ? markdownToHtml(content) : content;
 }
 
+export type TextEdit = { oldText: string; newText: string };
+export type TextEditResult = { ok: true; content: string } | { ok: false; error: string };
+
+// Mirrors Trilium's own first-party MCP tool implementation almost verbatim
+// (`note_tools.ts`'s `applyTextEdits` helper) -- same all-or-nothing
+// semantics, same uniqueness requirement, same error messages, since that
+// design was already well-considered and there's no reason to diverge from
+// it. Each edit's oldText must occur exactly once in the content at the
+// moment it's applied; edits are applied in order, so a later edit may
+// target text an earlier edit introduced. If any edit fails to match (or
+// matches ambiguously), no edit is committed.
+export function applyTextEdits(content: string, edits: TextEdit[]): TextEditResult {
+  let result = content;
+
+  for (let i = 0; i < edits.length; i++) {
+    const edit = edits[i];
+    if (!edit) continue;
+    const { oldText, newText } = edit;
+    const label = edits.length > 1 ? ` (edit ${i + 1} of ${edits.length})` : "";
+
+    if (oldText === "") {
+      return { ok: false, error: `oldText must not be empty${label}.` };
+    }
+    if (oldText === newText) {
+      return {
+        ok: false,
+        error: `oldText and newText are identical${label} -- nothing to change.`,
+      };
+    }
+
+    const firstIndex = result.indexOf(oldText);
+    if (firstIndex === -1) {
+      return { ok: false, error: `oldText not found in the note content${label}.` };
+    }
+    if (result.indexOf(oldText, firstIndex + oldText.length) !== -1) {
+      return {
+        ok: false,
+        error:
+          `oldText is not unique${label} -- it matches more than once. ` +
+          "Include more surrounding context so it identifies a single location.",
+      };
+    }
+
+    result = result.slice(0, firstIndex) + newText + result.slice(firstIndex + oldText.length);
+  }
+
+  return { ok: true, content: result };
+}
+
 export type ContentStatus = "present" | "null" | "empty";
 
 export function contentStatusFor(content: string): ContentStatus {

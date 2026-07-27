@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  applyTextEdits,
   contentStatusFor,
   extractSnippet,
   formatContentForWrite,
@@ -68,6 +69,65 @@ describe("formatContentForWrite", () => {
   it("never converts content for a non-'text' note", () => {
     const code = "# comment, not a heading\nconst x = [1, 2, 3];\n- not a list either";
     expect(formatContentForWrite(code, "code")).toBe(code);
+  });
+});
+
+describe("applyTextEdits", () => {
+  it("replaces a unique match", () => {
+    const result = applyTextEdits("const x = 1;", [{ oldText: "x = 1", newText: "x = 2" }]);
+    expect(result).toEqual({ ok: true, content: "const x = 2;" });
+  });
+
+  it("applies multiple edits in order, a later edit may target text an earlier one introduced", () => {
+    const result = applyTextEdits("hello world", [
+      { oldText: "hello", newText: "hi there" },
+      { oldText: "hi there world", newText: "hi there, world!" },
+    ]);
+    expect(result).toEqual({ ok: true, content: "hi there, world!" });
+  });
+
+  it("fails when oldText is empty", () => {
+    const result = applyTextEdits("anything", [{ oldText: "", newText: "x" }]);
+    expect(result).toEqual({ ok: false, error: "oldText must not be empty." });
+  });
+
+  it("fails when oldText and newText are identical", () => {
+    const result = applyTextEdits("anything", [{ oldText: "same", newText: "same" }]);
+    expect(result.ok).toBe(false);
+    expect((result as { error: string }).error).toMatch(/identical/);
+  });
+
+  it("fails when oldText isn't found", () => {
+    const result = applyTextEdits("hello world", [{ oldText: "missing", newText: "x" }]);
+    expect(result.ok).toBe(false);
+    expect((result as { error: string }).error).toMatch(/not found/);
+  });
+
+  it("fails when oldText matches more than once", () => {
+    const result = applyTextEdits("foo bar foo", [{ oldText: "foo", newText: "baz" }]);
+    expect(result.ok).toBe(false);
+    expect((result as { error: string }).error).toMatch(/not unique/);
+  });
+
+  it("commits nothing if any edit in the sequence fails (all-or-nothing)", () => {
+    const original = "hello world";
+    const result = applyTextEdits(original, [
+      { oldText: "hello", newText: "hi" },
+      { oldText: "missing", newText: "x" },
+    ]);
+    expect(result.ok).toBe(false);
+    // The first edit's effect must not leak into the error result's absence
+    // of a `content` field -- there's nothing partially applied to observe,
+    // but this asserts the shape doesn't accidentally carry one through.
+    expect(result).not.toHaveProperty("content");
+  });
+
+  it("labels the failing edit's position when multiple edits are given", () => {
+    const result = applyTextEdits("hello world", [
+      { oldText: "hello", newText: "hi" },
+      { oldText: "missing", newText: "x" },
+    ]);
+    expect((result as { error: string }).error).toMatch(/\(edit 2 of 2\)/);
   });
 });
 

@@ -22,14 +22,18 @@ Facts:
 - Every result carries a `url` -- always surface it, never omit.
 - "today's note" / "this week's journal" / inbox → `trilium_get_calendar_note`, not
   `trilium_search_notes`.
-- **Content format for `text`-type notes is Markdown, always** -- write `content` in
-  `trilium_create_note`/`trilium_update_note` as Markdown (`# heading`, `**bold**`, `- list`,
-  `[text](url)`); it's converted to Trilium's native HTML for you, and `trilium_read_note_content`
-  converts the stored HTML back to Markdown by default, so a note you read can be edited and
-  written straight back with the same syntax. Never hand-author literal HTML tags for ordinary
-  prose -- only pass `content_format: "html"` if you already have real HTML you deliberately want
-  stored verbatim. This does not apply to `code`-type notes (or any other non-`text` type): their
-  content is raw source, always written and read byte-for-byte, no conversion involved.
+- **Content format for `text`-type notes is Markdown, always, with no escape hatch** -- write
+  `content` in `trilium_create_note`/`trilium_update_note` as Markdown (`# heading`, `**bold**`,
+  `- list`, `[text](url)`); it's converted to Trilium's native HTML for you, and
+  `trilium_read_note_content` converts the stored HTML back to Markdown by default, so a note you
+  read can be edited and written straight back with the same syntax. Never hand-author literal
+  HTML tags for ordinary prose -- there is no way to write raw HTML verbatim. This does not apply
+  to `code`-type notes (or any other non-`text` type): their content is raw source, always written
+  and read byte-for-byte, no conversion involved.
+- `trilium_update_note`'s `content_mode: "edit"` applies one or more targeted find-and-replace
+  edits (`edits`) instead of resending the whole body -- much cheaper for a small change to a large
+  note. Only works on non-`text` notes (`code`, etc.); for `text` notes use `content_mode: "replace"`
+  or `"append"` instead.
 
 ## Procedure
 

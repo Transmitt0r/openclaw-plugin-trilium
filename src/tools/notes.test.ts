@@ -272,6 +272,162 @@ describe("trilium_update_note", () => {
     });
     expect(putBody).toBe("<p>existing</p><p>more</p>");
   });
+
+  describe("content_mode: edit", () => {
+    it("applies a targeted find-and-replace edit to a code note without resending the whole body", async () => {
+      let putBody: string | undefined;
+      const handle = setup([
+        {
+          test: (p, m) => p === "/etapi/notes/note1" && m === "GET",
+          handle: () => jsonResponse(baseNote({ type: "code", mime: "application/javascript" })),
+        },
+        {
+          test: (p, m) => p === "/etapi/notes/note1/content" && m === "GET",
+          handle: () => textResponse("const x = 1;\nconst y = 2;"),
+        },
+        {
+          test: (p, m) => p === "/etapi/notes/note1/content" && m === "PUT",
+          handle: async (req) => {
+            putBody = await req.text();
+            return new Response(null, { status: 204 });
+          },
+        },
+      ]);
+      const tool = createUpdateNoteTool(handle);
+      await tool.execute("call1", {
+        note_id: "note1",
+        content_mode: "edit",
+        edits: [{ old_text: "const x = 1;", new_text: "const x = 100;" }],
+      });
+      expect(putBody).toBe("const x = 100;\nconst y = 2;");
+    });
+
+    it("applies multiple edits in order", async () => {
+      let putBody: string | undefined;
+      const handle = setup([
+        {
+          test: (p, m) => p === "/etapi/notes/note1" && m === "GET",
+          handle: () => jsonResponse(baseNote({ type: "code" })),
+        },
+        {
+          test: (p, m) => p === "/etapi/notes/note1/content" && m === "GET",
+          handle: () => textResponse("hello world"),
+        },
+        {
+          test: (p, m) => p === "/etapi/notes/note1/content" && m === "PUT",
+          handle: async (req) => {
+            putBody = await req.text();
+            return new Response(null, { status: 204 });
+          },
+        },
+      ]);
+      const tool = createUpdateNoteTool(handle);
+      await tool.execute("call1", {
+        note_id: "note1",
+        content_mode: "edit",
+        edits: [
+          { old_text: "hello", new_text: "hi there" },
+          { old_text: "hi there world", new_text: "hi there, world!" },
+        ],
+      });
+      expect(putBody).toBe("hi there, world!");
+    });
+
+    it("rejects content_mode: edit on a 'text' note before ever fetching its content", async () => {
+      let contentFetched = false;
+      const handle = setup([
+        {
+          test: (p, m) => p === "/etapi/notes/note1" && m === "GET",
+          handle: () => jsonResponse(baseNote({ type: "text" })),
+        },
+        {
+          test: (p, m) => p === "/etapi/notes/note1/content" && m === "GET",
+          handle: () => {
+            contentFetched = true;
+            return textResponse("<p>hello</p>");
+          },
+        },
+      ]);
+      const tool = createUpdateNoteTool(handle);
+      await expect(
+        tool.execute("call1", {
+          note_id: "note1",
+          content_mode: "edit",
+          edits: [{ old_text: "hello", new_text: "hi" }],
+        }),
+      ).rejects.toThrow(/isn't supported for 'text' notes/);
+      expect(contentFetched).toBe(false);
+    });
+
+    it("throws with no write when oldText isn't found", async () => {
+      const handle = setup([
+        {
+          test: (p, m) => p === "/etapi/notes/note1" && m === "GET",
+          handle: () => jsonResponse(baseNote({ type: "code" })),
+        },
+        {
+          test: (p, m) => p === "/etapi/notes/note1/content" && m === "GET",
+          handle: () => textResponse("hello world"),
+        },
+        {
+          test: (p, m) => p === "/etapi/notes/note1/content" && m === "PUT",
+          handle: () => {
+            throw new Error("should never PUT when an edit fails to match");
+          },
+        },
+      ]);
+      const tool = createUpdateNoteTool(handle);
+      await expect(
+        tool.execute("call1", {
+          note_id: "note1",
+          content_mode: "edit",
+          edits: [{ old_text: "missing", new_text: "x" }],
+        }),
+      ).rejects.toThrow(/not found/);
+    });
+
+    it("throws when edits is empty", async () => {
+      const handle = setup([]);
+      const tool = createUpdateNoteTool(handle);
+      await expect(
+        tool.execute("call1", { note_id: "note1", content_mode: "edit", edits: [] }),
+      ).rejects.toThrow(/requires at least one entry/);
+    });
+
+    it("skips the type-check GET when a metadata change already reveals the type", async () => {
+      let getCount = 0;
+      const handle = setup([
+        {
+          test: (p, m) => p === "/etapi/notes/note1" && m === "PATCH",
+          handle: () => jsonResponse(baseNote({ type: "code", title: "New Title" })),
+        },
+        {
+          test: (p, m) => p === "/etapi/notes/note1/content" && m === "GET",
+          handle: () => textResponse("hello"),
+        },
+        {
+          test: (p, m) => p === "/etapi/notes/note1/content" && m === "PUT",
+          handle: () => new Response(null, { status: 204 }),
+        },
+        {
+          test: (p, m) => p === "/etapi/notes/note1" && m === "GET",
+          handle: () => {
+            getCount += 1;
+            return jsonResponse(baseNote({ type: "code" }));
+          },
+        },
+      ]);
+      const tool = createUpdateNoteTool(handle);
+      await tool.execute("call1", {
+        note_id: "note1",
+        title: "New Title",
+        content_mode: "edit",
+        edits: [{ old_text: "hello", new_text: "hi" }],
+      });
+      // Only the final result GET, not an extra type-check GET before it.
+      expect(getCount).toBe(1);
+    });
+  });
 });
 
 describe("trilium_get_note", () => {
