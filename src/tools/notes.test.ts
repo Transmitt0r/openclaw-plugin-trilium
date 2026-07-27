@@ -162,12 +162,11 @@ describe("trilium_update_note", () => {
   });
 
   // Regression test for a real bug found in review: the content PUT's
-  // result was discarded, so a failed write fell through to a re-fetch
-  // and reported the note's stale, pre-write content back as success. With
-  // no metadata fields given, there's already one legitimate GET (the
-  // "fetch current state" branch, since hasMetadataChanges is false) --
-  // the bug specifically added a *second* GET after the failed PUT, so
-  // this asserts exactly one GET happened, not zero.
+  // result was discarded, so a failed write fell through to a re-fetch and
+  // reported the note's stale, pre-write content back as success. With no
+  // metadata fields given, a content-only update no longer does a
+  // pre-write GET at all (see the next test) -- so this asserts zero GETs
+  // happened, not one.
   it("throws instead of silently returning stale content when the content PUT fails", async () => {
     let getCount = 0;
     const handle = setup([
@@ -187,7 +186,59 @@ describe("trilium_update_note", () => {
     await expect(
       tool.execute("call1", { note_id: "note1", content: "new content" }),
     ).rejects.toThrow(/NOTE_IS_PROTECTED/);
+    expect(getCount).toBe(0);
+  });
+
+  // Regression test for a real perf issue found in review: a content-only
+  // update (no title/type/mime) used to do a pre-write GET whose result was
+  // immediately discarded, then a second GET after the PUT -- 3 calls where
+  // 2 suffice. Asserts the pre-write GET no longer happens.
+  it("does a content-only update in exactly one GET (no wasted pre-write fetch)", async () => {
+    let getCount = 0;
+    const handle = setup([
+      {
+        test: (p, m) => p === "/etapi/notes/note1/content" && m === "PUT",
+        handle: () => new Response(null, { status: 204 }),
+      },
+      {
+        test: (p, m) => p === "/etapi/notes/note1" && m === "GET",
+        handle: () => {
+          getCount += 1;
+          return jsonResponse(baseNote());
+        },
+      },
+    ]);
+    const tool = createUpdateNoteTool(handle);
+    await tool.execute("call1", { note_id: "note1", content: "hello" });
     expect(getCount).toBe(1);
+  });
+
+  it("appends to existing content server-side without the caller resending the body", async () => {
+    let putBody: string | undefined;
+    const handle = setup([
+      {
+        test: (p, m) => p === "/etapi/notes/note1/content" && m === "GET",
+        handle: () => textResponse("<p>existing</p>"),
+      },
+      {
+        test: (p, m) => p === "/etapi/notes/note1/content" && m === "PUT",
+        handle: async (req) => {
+          putBody = await req.text();
+          return new Response(null, { status: 204 });
+        },
+      },
+      {
+        test: (p, m) => p === "/etapi/notes/note1" && m === "GET",
+        handle: () => jsonResponse(baseNote()),
+      },
+    ]);
+    const tool = createUpdateNoteTool(handle);
+    await tool.execute("call1", {
+      note_id: "note1",
+      content: "more",
+      content_mode: "append",
+    });
+    expect(putBody).toBe("<p>existing</p><p>more</p>");
   });
 });
 
@@ -279,6 +330,41 @@ describe("trilium_get_note", () => {
     expect(result.attachments).toEqual([{ attachmentId: "a1", title: "att" }]);
     expect(result.revisions).toEqual([{ revisionId: "r1" }]);
     expect(result.content_snippet).toContain("findme");
+  });
+
+  // Regression test for a real token-efficiency issue found in review: the
+  // raw parent/child id arrays used to survive alongside the resolved
+  // parents/children, encoding the same tree edges twice. Also checks that
+  // attributes get flattened into labels/relations here the same way
+  // trilium_search_notes already does.
+  it("drops raw parent/child id arrays once resolved, and flattens attributes", async () => {
+    const handle = setup([
+      {
+        test: (p, m) => p === "/etapi/notes/note1" && m === "GET",
+        handle: () =>
+          jsonResponse(
+            baseNote({
+              parentNoteIds: ["root"],
+              childNoteIds: [],
+              attributes: [{ attributeId: "a1", type: "label", name: "archived" }],
+            }),
+          ),
+      },
+      {
+        test: (p, m) => p === "/etapi/notes/root" && m === "GET",
+        handle: () => jsonResponse(baseNote({ noteId: "root", title: "Root", parentNoteIds: [] })),
+      },
+    ]);
+    const tool = createGetNoteTool(handle);
+    const result = (await tool.execute("call1", { note_id: "note1" })).details as Record<
+      string,
+      unknown
+    >;
+    expect(result.parentNoteIds).toBeUndefined();
+    expect(result.childNoteIds).toBeUndefined();
+    expect(result.parentBranchIds).toBeUndefined();
+    expect(result.childBranchIds).toBeUndefined();
+    expect(result.labels).toEqual(["archived"]);
   });
 });
 
@@ -375,6 +461,76 @@ describe("trilium_search_notes", () => {
     expect(result.results).toHaveLength(1);
     expect(result.results[0]?.noteId).toBe("note2");
     expect(result.results[0]?.content_snippet).toBe("matched text");
+  });
+
+  // Regression test for a real goal-reachability issue found in review:
+  // the tool's own description promised a raw `attributes` array but the
+  // implementation dropped relations entirely -- and stripped several
+  // other dead fields (blobId, isProtected, raw id arrays, duplicate UTC
+  // timestamps) that had no agent value.
+  it("flattens labels/relations and strips dead fields from results", async () => {
+    const handle = setup([
+      {
+        test: (p, m) => p === "/etapi/notes" && m === "GET",
+        handle: () =>
+          jsonResponse({
+            results: [
+              baseNote({
+                attributes: [
+                  { attributeId: "a1", type: "label", name: "priority", value: "high" },
+                  { attributeId: "a2", type: "relation", name: "author", value: "note9" },
+                ],
+              }),
+            ],
+          }),
+      },
+    ]);
+    const tool = createSearchNotesTool(handle, noSemanticHandle());
+    const result = (await tool.execute("call1", { search: "test" })).details as {
+      results: Record<string, unknown>[];
+    };
+    const [note] = result.results;
+    expect(note?.labels).toEqual(["priority=high"]);
+    expect(note?.relations).toEqual([{ name: "author", value: "note9", attribute_id: "a2" }]);
+    expect(note?.attributes).toBeUndefined();
+    expect(note?.blobId).toBeUndefined();
+    expect(note?.isProtected).toBeUndefined();
+    expect(note?.parentNoteIds).toBeUndefined();
+    expect(note?.childNoteIds).toBeUndefined();
+    expect(note?.utcDateCreated).toBeUndefined();
+    expect(note?.utcDateModified).toBeUndefined();
+  });
+
+  // Regression test for a real goal-reachability issue found in review:
+  // there was no way to tell whether a search hit the 100-result cap and
+  // silently omitted matches.
+  it("flags truncated:true when the result count hits the requested limit", async () => {
+    const handle = setup([
+      {
+        test: (p, m) => p === "/etapi/notes" && m === "GET",
+        handle: () =>
+          jsonResponse({ results: [baseNote({ noteId: "n1" }), baseNote({ noteId: "n2" })] }),
+      },
+    ]);
+    const tool = createSearchNotesTool(handle, noSemanticHandle());
+    const result = (await tool.execute("call1", { search: "test", limit: 2 })).details as {
+      truncated?: boolean;
+    };
+    expect(result.truncated).toBe(true);
+  });
+
+  it("omits truncated when fewer results than the limit come back", async () => {
+    const handle = setup([
+      {
+        test: (p, m) => p === "/etapi/notes" && m === "GET",
+        handle: () => jsonResponse({ results: [baseNote()] }),
+      },
+    ]);
+    const tool = createSearchNotesTool(handle, noSemanticHandle());
+    const result = (await tool.execute("call1", { search: "test", limit: 5 })).details as {
+      truncated?: boolean;
+    };
+    expect(result.truncated).toBeUndefined();
   });
 });
 

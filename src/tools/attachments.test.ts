@@ -117,7 +117,9 @@ describe("trilium_update_attachment", () => {
 
   // Regression test for a real bug found in review: the content PUT's
   // result was discarded, so a failed write fell through to a re-fetch
-  // and reported stale content as success.
+  // and reported stale content as success. With no metadata fields given,
+  // a content-only update no longer does a pre-write GET at all (see the
+  // next test) -- so this asserts zero GETs happened, not one.
   it("throws instead of silently returning stale content when the content PUT fails", async () => {
     let getCount = 0;
     const handle = setup([
@@ -126,9 +128,6 @@ describe("trilium_update_attachment", () => {
         handle: () => errorResponse(400, "VALIDATION_ERROR", "bad content"),
       },
       {
-        // With no metadata fields given, one legitimate "fetch current
-        // state" GET happens before the content PUT attempt -- the bug
-        // this regresses added a *second* GET after the failed PUT.
         test: (p, m) => p === "/etapi/attachments/att1" && m === "GET",
         handle: () => {
           getCount += 1;
@@ -140,6 +139,29 @@ describe("trilium_update_attachment", () => {
     await expect(tool.execute("call1", { attachment_id: "att1", content: "x" })).rejects.toThrow(
       /VALIDATION_ERROR/,
     );
+    expect(getCount).toBe(0);
+  });
+
+  // Regression test for a real perf issue found in review: a content-only
+  // update used to do a pre-write GET whose result was immediately
+  // discarded, then a second GET after the PUT -- 3 calls where 2 suffice.
+  it("does a content-only update in exactly one GET (no wasted pre-write fetch)", async () => {
+    let getCount = 0;
+    const handle = setup([
+      {
+        test: (p, m) => p === "/etapi/attachments/att1/content" && m === "PUT",
+        handle: () => new Response(null, { status: 204 }),
+      },
+      {
+        test: (p, m) => p === "/etapi/attachments/att1" && m === "GET",
+        handle: () => {
+          getCount += 1;
+          return jsonResponse({ attachmentId: "att1" });
+        },
+      },
+    ]);
+    const tool = createUpdateAttachmentTool(handle);
+    await tool.execute("call1", { attachment_id: "att1", content: "hello" });
     expect(getCount).toBe(1);
   });
 });

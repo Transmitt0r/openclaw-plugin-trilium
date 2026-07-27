@@ -135,7 +135,11 @@ export function toToolResult<T>(result: T): {
   details: T;
 } {
   return {
-    content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+    // Compact, not pretty-printed -- the model reads this as data, not as
+    // human-formatted output, so indentation/newlines are pure token
+    // overhead. `details` (below) carries the same object, unformatted,
+    // for any non-model consumer that wants it.
+    content: [{ type: "text", text: JSON.stringify(result) }],
     details: result,
   };
 }

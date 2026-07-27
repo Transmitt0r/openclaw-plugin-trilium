@@ -162,23 +162,20 @@ export function createUpdateAttachmentTool(
         params.role !== undefined ||
         params.position !== undefined;
 
-      let attachment = hasMetadataChanges
-        ? unwrap(
-            await client.PATCH("/attachments/{attachmentId}", {
-              params: { path: { attachmentId: params.attachment_id } },
-              body: {
-                title: params.title,
-                mime: params.mime,
-                role: params.role,
-                position: params.position,
-              },
-            }),
-          )
-        : unwrap(
-            await client.GET("/attachments/{attachmentId}", {
-              params: { path: { attachmentId: params.attachment_id } },
-            }),
-          );
+      let attachment: Record<string, unknown> | undefined;
+      if (hasMetadataChanges) {
+        attachment = unwrap(
+          await client.PATCH("/attachments/{attachmentId}", {
+            params: { path: { attachmentId: params.attachment_id } },
+            body: {
+              title: params.title,
+              mime: params.mime,
+              role: params.role,
+              position: params.position,
+            },
+          }),
+        );
+      }
 
       if (params.content !== undefined) {
         // See notes.ts's identical unwrap() usage on its content PUT -- a
@@ -194,6 +191,15 @@ export function createUpdateAttachmentTool(
             bodySerializer: (body: unknown) => body as string,
           }),
         );
+        attachment = unwrap(
+          await client.GET("/attachments/{attachmentId}", {
+            params: { path: { attachmentId: params.attachment_id } },
+          }),
+        );
+      } else if (attachment === undefined) {
+        // No metadata change and no content write -- the only thing left to
+        // do is report current state, so this is the sole fetch (unlike the
+        // content-write branch above, nothing here is discarded unread).
         attachment = unwrap(
           await client.GET("/attachments/{attachmentId}", {
             params: { path: { attachmentId: params.attachment_id } },
